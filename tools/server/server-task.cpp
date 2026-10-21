@@ -69,6 +69,7 @@ json task_params::to_json(bool only_metrics) const {
             {"n_predict",                 n_predict}, // TODO: deduplicate?
             {"n_keep",                    n_keep},
             {"n_discard",                 n_discard},
+            {"prefill_chunk_size",         prefill_chunk_size},
             {"ignore_eos",                sampling.ignore_eos},
             {"stream",                    stream},
             {"n_probs",                   sampling.n_probs},
@@ -98,6 +99,7 @@ json task_params::to_json(bool only_metrics) const {
         {"dynatemp_range",            sampling.dynatemp_range},
         {"dynatemp_exponent",         sampling.dynatemp_exponent},
         {"top_k",                     sampling.top_k},
+        {"prefill_chunk_size",         prefill_chunk_size},
         {"top_p",                     sampling.top_p},
         {"min_p",                     sampling.min_p},
         {"top_n_sigma",               sampling.top_n_sigma},

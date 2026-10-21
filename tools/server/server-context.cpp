@@ -3934,8 +3934,13 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    const int32_t prefill_chunk_size = slot.task->params.prefill_chunk_size;
+                    const bool limit_prefill = !generating.empty() && prefill_chunk_size > 0 &&
+                        slot.task->type == SERVER_TASK_TYPE_COMPLETION && !input_tokens.has_mtmd;
+
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch &&
+                           (!limit_prefill || batch.size() - n_tokens_prev < prefill_chunk_size)) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -5117,6 +5122,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
     json default_generation_settings_for_props = json {
         { "params", tparams.to_json(true) },
         { "n_ctx",  meta.slot_n_ctx },
+        { "n_batch", params.n_batch },
     };
 
     std::string tmpl_default = common_chat_templates_source(meta.chat_params.tmpls.get(), "");

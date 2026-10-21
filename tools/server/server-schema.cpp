@@ -37,6 +37,17 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("return_progress", params.return_progress))
         ->set_desc("Include prompt processing progress events in stream mode"));
 
+    add((new field_num("prefill_chunk_size", params.prefill_chunk_size))
+        ->set_hard_limits(0, params_base.n_batch)
+        ->set_handler([n_batch = params_base.n_batch](field_eval_context & ctx, const json & data) {
+            const auto & value = data.at("prefill_chunk_size");
+            if (!value.is_number_integer() || value.get<double>() < 0 || value.get<double>() > n_batch) {
+                throw std::invalid_argument("Expected an integer between 0 and the server batch size");
+            }
+            ctx.params.prefill_chunk_size = value.get<int32_t>();
+        })
+        ->set_desc("Limit text completion prefill tokens per iteration while another slot generates; 0 disables the limit"));
+
     add((new field_num("sse_ping_interval", params.sse_ping_interval))
         ->set_hard_limits(-1, INT32_MAX)
         ->set_desc("Interval in seconds between SSE comment pings emitted while the stream stays silent, -1 disables pings"));

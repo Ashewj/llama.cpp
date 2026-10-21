@@ -10,6 +10,11 @@
 #include "ngram-mod.h"
 #include "sampling.h"
 
+#ifdef LLAMA_STRATA_LOOKUP
+#include "strata/spec/suffix_drafter.hpp"
+#include "strata/spec/draft_policy.hpp"
+#endif
+
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
@@ -80,7 +85,10 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+#ifdef LLAMA_STRATA_LOOKUP
+    {"strata-lookup", COMMON_SPECULATIVE_TYPE_STRATA_LOOKUP},
+#endif
 };
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
@@ -1827,6 +1835,74 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 };
 
+#ifdef LLAMA_STRATA_LOOKUP
+struct common_speculative_impl_strata_lookup : public common_speculative_impl {
+    struct sequence {
+        strata::spec::SuffixDrafter suffix;
+        strata::spec::DraftPolicy policy;
+        int64_t started = 0;
+        int offered = 0;
+        int accepted = 0;
+        int match = 0;
+
+        sequence(int min_match, int max_k)
+            : suffix(min_match, std::max(32, min_match), 1u << 16), policy(max_k + 1) {}
+    };
+
+    std::vector<sequence> seqs;
+
+    common_speculative_impl_strata_lookup(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_STRATA_LOOKUP, n_seq,
+                                  std::clamp<int>(params.ngram_simple.size_m, 1, strata::spec::DraftPolicy::kMaxT - 1)) {
+        seqs.reserve(n_seq);
+        for (uint32_t i = 0; i < n_seq; ++i) {
+            seqs.emplace_back(std::max<int>(3, params.ngram_simple.size_n), n_max);
+        }
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        auto & s = seqs.at(seq_id);
+        s.suffix.reset();
+        s.suffix.synchronize(prompt.data(), prompt.size());
+        s.policy = strata::spec::DraftPolicy(n_max + 1);
+        s.started = 0;
+        s.offered = s.accepted = s.match = 0;
+    }
+
+    bool process(const common_batch & /*batch*/) override { return true; }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) continue;
+            auto & s = seqs[seq_id];
+            const int64_t now = ggml_time_us();
+            if (s.started) {
+                s.policy.observe(s.offered > 0, s.offered + 1, s.accepted, s.match,
+                                 (now - s.started) / 1000.0);
+            }
+            s.suffix.synchronize(dp.prompt->data(), dp.prompt->size());
+            int32_t proposed[strata::spec::DraftPolicy::kMaxT];
+            const int limit = dp.n_max >= 0 ? std::min(n_max, dp.n_max) : n_max;
+            const int available = s.suffix.propose_after(&dp.id_last, 1, limit, proposed);
+            s.match = s.suffix.last_match();
+            const auto pick = s.policy.choose(1, available, s.match);
+            s.offered = pick.lookup ? pick.t - 1 : 0;
+            s.accepted = 0;
+            if (s.offered) dp.result->assign(proposed, proposed + s.offered);
+            s.started = ggml_time_us();
+        }
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        if (!is_other) {
+            auto & s = seqs.at(seq_id);
+            s.accepted = std::min<int>(n_accepted, s.offered);
+        }
+    }
+};
+#endif
+
 // state of self-speculation (simple implementation, not ngram-map)
 struct common_speculative_impl_ngram_simple : public common_speculative_impl {
     common_params_speculative_ngram_map params;
@@ -2317,6 +2393,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
+        case COMMON_SPECULATIVE_TYPE_STRATA_LOOKUP: return "strata-lookup";
         default:                                    return "unknown";
     }
 }
@@ -2404,6 +2481,9 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
+                break;
+            case COMMON_SPECULATIVE_TYPE_STRATA_LOOKUP:
+                n_max = std::max(n_max, std::clamp<int>(spec->ngram_simple.size_m, 1, 7));
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
                 n_max = std::max(n_max, (int32_t) spec->ngram_simple.size_m);
@@ -2693,10 +2773,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         };
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 11);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 12);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_STRATA_LOOKUP);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
@@ -2735,6 +2816,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK: {
                 impls.push_back(std::make_unique<common_speculative_impl_draft_dflash>(
                         config.params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_STRATA_LOOKUP: {
+#ifdef LLAMA_STRATA_LOOKUP
+                impls.push_back(std::make_unique<common_speculative_impl_strata_lookup>(config.params, n_seq));
+#else
+                throw std::runtime_error("strata-lookup requires LLAMA_STRATA_SOURCE_DIR at build time");
+#endif
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {

@@ -213,6 +213,7 @@ bool server_http_context::init_listener(const common_params & params) {
     });
 
     // set timeouts and change hostname and port
+    srv->set_tcp_nodelay(true);
     srv->set_read_timeout (params.timeout_read);
     srv->set_write_timeout(params.timeout_write);
     srv->set_socket_options([reuse_port = params.reuse_port](const socket_t sock) {

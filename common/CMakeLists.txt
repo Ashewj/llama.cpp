@@ -151,6 +151,15 @@ endif()
 target_link_libraries(${TARGET} PUBLIC  llama-common-base)
 target_link_libraries(${TARGET} PRIVATE cpp-httplib)
 
+set(LLAMA_STRATA_SOURCE_DIR "" CACHE PATH "Local Strata checkout for optional suffix speculation")
+if (LLAMA_STRATA_SOURCE_DIR)
+    target_sources(${TARGET} PRIVATE
+        "${LLAMA_STRATA_SOURCE_DIR}/src/spec/suffix_drafter.cpp"
+        "${LLAMA_STRATA_SOURCE_DIR}/src/spec/draft_policy.cpp")
+    target_include_directories(${TARGET} PRIVATE "${LLAMA_STRATA_SOURCE_DIR}/include")
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_STRATA_LOOKUP)
+endif()
+
 if (LLAMA_LLGUIDANCE)
     include(ExternalProject)
     set(LLGUIDANCE_SRC ${CMAKE_BINARY_DIR}/llguidance/source)
